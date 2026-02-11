@@ -61,16 +61,20 @@ def main():
         h_ratio = gaze.horizontal_ratio()
         v_ratio = gaze.vertical_ratio()
         
+        # Debug: Print if no gaze detected
+        if h_ratio is None and frame_count % 30 == 0:
+            print(f"Frame {frame_count}: No gaze detected - landmarks={gaze.landmarks is not None}, pupils_located={gaze.pupils_located}")
+        
         if h_ratio is not None:
             # Apply smoothing
             smooth_h = filter_x(current_t, h_ratio)
             
             # Determine direction
-            if smooth_h < 0.40:
+            if smooth_h < 0.35:
                 direction = "LOOKING LEFT"
                 color = (0, 255, 0)  # Green
                 bar_width = int(smooth_h * screen_w)
-            elif smooth_h > 0.60:
+            elif smooth_h > 0.65:
                 direction = "LOOKING RIGHT"
                 color = (255, 0, 0)  # Blue
                 bar_width = int(smooth_h * screen_w)

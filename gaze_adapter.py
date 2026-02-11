@@ -1,6 +1,8 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 class GazeAdapter:
     """
@@ -23,13 +25,29 @@ class GazeAdapter:
     BLINK_THRESHOLD = 0.51
     
     def __init__(self):
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
+        # Download the face landmarker model if not present
+        import os
+        import urllib.request
+        
+        model_path = "face_landmarker.task"
+        if not os.path.exists(model_path):
+            print("Downloading face landmarker model...")
+            url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+            urllib.request.urlretrieve(url, model_path)
+            print("Model downloaded.")
+        
+        # Create FaceLandmarker using new API
+        base_options = python.BaseOptions(model_asset_path=model_path)
+        options = vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5
         )
+        self.face_landmarker = vision.FaceLandmarker.create_from_options(options)
         self.landmarks = None
         self.frame = None
         self.frame_shape = (480, 640)
@@ -46,10 +64,14 @@ class GazeAdapter:
         self.frame = frame
         self.frame_shape = frame.shape[:2]  # h, w
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb_frame)
         
-        if results.multi_face_landmarks:
-            self.landmarks = results.multi_face_landmarks[0]
+        # Convert to MediaPipe Image format
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        results = self.face_landmarker.detect(mp_image)
+        
+        if results.face_landmarks:
+            # Convert to the same structure as the old API
+            self.landmarks = type('obj', (object,), {'landmark': results.face_landmarks[0]})()
             self._calculate_iris_positions()
             self._detect_blink()
         else:
@@ -164,9 +186,14 @@ class GazeAdapter:
         if not self.pupils_located:
             return None
         
-        # Average the normalized horizontal offset from both eyes
-        left_ratio = 0.5 + (self._left_iris_pos[0] / self._left_eye_width) if self._left_eye_width > 0 else 0.5
-        right_ratio = 0.5 + (self._right_iris_pos[0] / self._right_eye_width) if self._right_eye_width > 0 else 0.5
+        # Calculate normalized horizontal offset from both eyes
+        # Iris position[0] is relative to eye center
+        # When looking LEFT, iris moves left (negative), we want ratio < 0.5
+        # When looking RIGHT, iris moves right (positive), we want ratio > 0.5
+        # Negate to get correct direction mapping
+        
+        left_ratio = 0.5 - (self._left_iris_pos[0] / (self._left_eye_width * 0.3)) if self._left_eye_width > 0 else 0.5
+        right_ratio = 0.5 - (self._right_iris_pos[0] / (self._right_eye_width * 0.3)) if self._right_eye_width > 0 else 0.5
         
         ratio = (left_ratio + right_ratio) / 2
         return max(0.0, min(1.0, ratio))
