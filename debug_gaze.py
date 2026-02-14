@@ -87,8 +87,8 @@ def main():
         v_ratio = gaze.vertical_ratio()
         is_blinking = gaze.is_blinking()
         
-        # Apply smoothing
-        smooth_h = filter_x(current_t, h_ratio) if h_ratio else None
+        # Apply smoothing (use "is not None" so h_ratio=0.0 is still smoothed)
+        smooth_h = filter_x(current_t, h_ratio) if h_ratio is not None else None
         
         # HORIZONTAL RATIO ANALYSIS
         cv2.putText(canvas, "=== HORIZONTAL GAZE ===", (50, int(y)),
@@ -122,12 +122,12 @@ def main():
             y += line_height
             
             # Thresholds used
-            cv2.putText(canvas, "Thresholds: LEFT < 0.40 | CENTER 0.40-0.60 | RIGHT > 0.60", (50, y),
+            cv2.putText(canvas, "Thresholds: LEFT < 0.40 | CENTER 0.40-0.60 | RIGHT > 0.60", (50, int(y)),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (150, 150, 150), 1)
             y += line_height * 1.5
             
             # Visual bar
-            cv2.putText(canvas, "Visual Gauge:", (50, y),
+            cv2.putText(canvas, "Visual Gauge:", (50, int(y)),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 200, 200), 1)
             y += 40
             
