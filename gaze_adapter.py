@@ -1,3 +1,5 @@
+from collections import deque
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -10,9 +12,9 @@ class GazeAdapter:
     Based on the original Python-Gaze-Face-Tracker approach.
     """
     
-    # Landmark indices (from original main.py)
-    LEFT_IRIS = [474, 475, 476, 477]
-    RIGHT_IRIS = [469, 470, 471, 472]
+    # Landmark indices: 5 iris points per eye (center + 4 cardinal)
+    LEFT_IRIS = [473, 474, 475, 476, 477]
+    RIGHT_IRIS = [468, 469, 470, 471, 472]
     L_H_LEFT = 33   # Left eye left corner
     L_H_RIGHT = 133  # Left eye right corner
     R_H_LEFT = 362   # Right eye left corner
@@ -22,7 +24,7 @@ class GazeAdapter:
     RIGHT_EYE_POINTS = [33, 160, 159, 158, 133, 153, 145, 144]
     LEFT_EYE_POINTS = [362, 385, 386, 387, 263, 373, 374, 380]
     
-    BLINK_THRESHOLD = 0.51
+    BLINK_THRESHOLD = 0.05  # Adjusted threshold for blink detection
     
     def __init__(self):
         # Download the face landmarker model if not present
@@ -59,6 +61,15 @@ class GazeAdapter:
         self._left_eye_center = None
         self._right_eye_center = None
 
+        # Temporal averaging buffers (3 frames)
+        _BUF_SIZE = 3
+        self._buf_left_iris = deque(maxlen=_BUF_SIZE)
+        self._buf_right_iris = deque(maxlen=_BUF_SIZE)
+        self._buf_l_left = deque(maxlen=_BUF_SIZE)
+        self._buf_l_right = deque(maxlen=_BUF_SIZE)
+        self._buf_r_left = deque(maxlen=_BUF_SIZE)
+        self._buf_r_right = deque(maxlen=_BUF_SIZE)
+
     def refresh(self, frame):
         """Processes the frame to find face landmarks."""
         self.frame = frame
@@ -79,6 +90,12 @@ class GazeAdapter:
             self._blinking = False
             self._left_iris_pos = None
             self._right_iris_pos = None
+            self._buf_left_iris.clear()
+            self._buf_right_iris.clear()
+            self._buf_l_left.clear()
+            self._buf_l_right.clear()
+            self._buf_r_left.clear()
+            self._buf_r_right.clear()
 
     @property
     def pupils_located(self):
@@ -110,37 +127,47 @@ class GazeAdapter:
         return np.mean(points, axis=0)
 
     def _calculate_iris_positions(self):
-        """Calculate iris positions relative to eye corners (original approach)."""
+        """Calculate iris positions relative to eye corners, with temporal averaging."""
         if not self.landmarks:
             return
         
         h, w = self.frame_shape
         
-        # Get eye corners
+        # Get this frame's raw landmarks
         l_left = self._get_landmark_coords(self.L_H_LEFT)
         l_right = self._get_landmark_coords(self.L_H_RIGHT)
         r_left = self._get_landmark_coords(self.R_H_LEFT)
         r_right = self._get_landmark_coords(self.R_H_RIGHT)
-        
-        # Get iris centers (using all 4 iris points like original)
         left_iris = self._get_iris_center(self.LEFT_IRIS)
         right_iris = self._get_iris_center(self.RIGHT_IRIS)
         
         if any(x is None for x in [l_left, l_right, r_left, r_right, left_iris, right_iris]):
             return
         
-        # Calculate eye centers
-        self._left_eye_center = (l_left + l_right) / 2
-        self._right_eye_center = (r_left + r_right) / 2
+        # Push into temporal buffers
+        self._buf_left_iris.append(left_iris)
+        self._buf_right_iris.append(right_iris)
+        self._buf_l_left.append(l_left)
+        self._buf_l_right.append(l_right)
+        self._buf_r_left.append(r_left)
+        self._buf_r_right.append(r_right)
         
-        # Calculate relative iris position (dx, dy) from eye center
-        # This is similar to the original vector_position approach
-        self._left_iris_pos = left_iris - self._left_eye_center
-        self._right_iris_pos = right_iris - self._right_eye_center
+        # Use averaged values across buffered frames
+        avg_left_iris = np.mean(self._buf_left_iris, axis=0)
+        avg_right_iris = np.mean(self._buf_right_iris, axis=0)
+        avg_l_left = np.mean(self._buf_l_left, axis=0)
+        avg_l_right = np.mean(self._buf_l_right, axis=0)
+        avg_r_left = np.mean(self._buf_r_left, axis=0)
+        avg_r_right = np.mean(self._buf_r_right, axis=0)
         
-        # Calculate eye widths for normalization
-        self._left_eye_width = np.linalg.norm(l_right - l_left)
-        self._right_eye_width = np.linalg.norm(r_right - r_left)
+        self._left_eye_center = (avg_l_left + avg_l_right) / 2
+        self._right_eye_center = (avg_r_left + avg_r_right) / 2
+        
+        self._left_iris_pos = avg_left_iris - self._left_eye_center
+        self._right_iris_pos = avg_right_iris - self._right_eye_center
+        
+        self._left_eye_width = np.linalg.norm(avg_l_right - avg_l_left)
+        self._right_eye_width = np.linalg.norm(avg_r_right - avg_r_left)
 
     def _euclidean_distance_3D(self, eye_points_indices):
         """Calculate eye aspect ratio for blink detection (from original)."""
@@ -192,8 +219,8 @@ class GazeAdapter:
         # When looking RIGHT, iris moves right (positive), we want ratio > 0.5
         # Negate to get correct direction mapping
         
-        left_ratio = 0.5 - (self._left_iris_pos[0] / (self._left_eye_width * 0.3)) if self._left_eye_width > 0 else 0.5
-        right_ratio = 0.5 - (self._right_iris_pos[0] / (self._right_eye_width * 0.3)) if self._right_eye_width > 0 else 0.5
+        left_ratio = 0.5 - (self._left_iris_pos[0] / (self._left_eye_width * 0.5)) if self._left_eye_width > 0 else 0.5
+        right_ratio = 0.5 - (self._right_iris_pos[0] / (self._right_eye_width * 0.5)) if self._right_eye_width > 0 else 0.5
         
         ratio = (left_ratio + right_ratio) / 2
         return max(0.0, min(1.0, ratio))
@@ -208,8 +235,8 @@ class GazeAdapter:
         
         # Use eye width as approximate scale for vertical too
         # (vertical range is smaller than horizontal)
-        left_ratio = 0.5 + (self._left_iris_pos[1] / (self._left_eye_width * 0.5)) if self._left_eye_width > 0 else 0.5
-        right_ratio = 0.5 + (self._right_iris_pos[1] / (self._right_eye_width * 0.5)) if self._right_eye_width > 0 else 0.5
+        left_ratio = 0.5 + (self._left_iris_pos[1] / (self._left_eye_width * 0.7)) if self._left_eye_width > 0 else 0.5
+        right_ratio = 0.5 + (self._right_iris_pos[1] / (self._right_eye_width * 0.7)) if self._right_eye_width > 0 else 0.5
         
         ratio = (left_ratio + right_ratio) / 2
         return max(0.0, min(1.0, ratio))

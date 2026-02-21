@@ -85,6 +85,44 @@ def _countdown(
     return True
 
 
+def get_primary_display_size(fallback_w: int = 1400, fallback_h: int = 900) -> Tuple[int, int]:
+    """Return primary display size in logical points (what OpenCV uses on macOS).
+
+    Tries Quartz (current Python), then system Python with Quartz,
+    then falls back to the provided defaults.
+    """
+    # Method 1: Quartz in current Python
+    try:
+        import Quartz
+        bounds = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
+        w, h = int(bounds.size.width), int(bounds.size.height)
+        if w > 0 and h > 0:
+            print(f"Detected display: {w}x{h}")
+            return w, h
+    except Exception:
+        pass
+
+    # Method 2: System Python (always has PyObjC on macOS)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["/usr/bin/python3", "-c",
+             "import Quartz; d = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID()); "
+             "print(int(d.size.width), int(d.size.height))"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split()
+            w, h = int(parts[0]), int(parts[1])
+            if w > 0 and h > 0:
+                print(f"Detected display: {w}x{h}")
+                return w, h
+    except Exception:
+        pass
+
+    return fallback_w, fallback_h
+
+
 def get_screen_resolution(default_w: int = 1920, default_h: int = 1080) -> Tuple[int, int]:
     """Return a safe window size; caller can override via CLI."""
     return default_w, default_h
@@ -141,9 +179,11 @@ def collect_calibration_points(
         print("Error: Unable to access camera.")
         return None
 
-    # Points for calibration
+    # Points for calibration (13 points: extra coverage in top half for better accuracy)
     points_norm = [
         (0.05, 0.05), (0.50, 0.05), (0.95, 0.05),
+        (0.25, 0.05), (0.75, 0.05),                   # extra: top row quarter marks
+        (0.25, 0.25), (0.75, 0.25),                   # extra: upper-mid row
         (0.05, 0.50), (0.50, 0.50), (0.95, 0.50),
         (0.05, 0.95), (0.50, 0.95), (0.95, 0.95),
     ]
@@ -165,11 +205,23 @@ def collect_calibration_points(
 
     print(f"Starting calibration for {session_label}. Look at the red dots.")
 
+    # Warmup: feed a few frames so the gaze tracker stabilizes before point 1
+    print("Warming up tracker (2s)...")
+    warmup_end = time.time() + 2.0
+    while time.time() < warmup_end:
+        ret, frame = webcam.read()
+        if ret:
+            gaze.refresh(frame)
+        if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+            webcam.release()
+            cv2.destroyAllWindows()
+            return None
+
     for i, (px, py) in enumerate(points_norm):
         target_x = int(px * calib_w)
         target_y = int(py * calib_h)
 
-        # 3.5 seconds total (1.5 settle, 2.0 record)
+        # 5 seconds total (1.5 settle, 3.5 record) — longer recording helps get valid gaze samples
         start_time = time.time()
         samples_h: List[float] = []
         samples_v: List[float] = []
@@ -188,7 +240,7 @@ def collect_calibration_points(
             draw_calibration_target(stimulus, target_x, target_y)
             cv2.putText(
                 stimulus,
-                f"Point {i + 1}/9",
+                f"Point {i + 1}/{len(points_norm)}",
                 (50, 50),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,
@@ -219,18 +271,22 @@ def collect_calibration_points(
                 cv2.destroyAllWindows()
                 return None
 
-            if elapsed > 3.5:
+            if elapsed > 5.0:
                 break
 
         if samples_h and samples_v:
             avg_h = float(np.median(samples_h))
             avg_v = float(np.median(samples_v))
+            std_h = float(np.std(samples_h))
+            std_v = float(np.std(samples_v))
             calibration_data["points"].append(
                 {
                     "target_x": int(target_x),
                     "target_y": int(target_y),
                     "gaze_h": avg_h,
                     "gaze_v": avg_v,
+                    "std_h": std_h,
+                    "std_v": std_v,
                     "samples": int(len(samples_h)),
                     "samples_total": int(samples_total),
                     "samples_blink": int(samples_blink),
@@ -244,6 +300,8 @@ def collect_calibration_points(
                     "target_y": int(target_y),
                     "gaze_h": None,
                     "gaze_v": None,
+                    "std_h": None,
+                    "std_v": None,
                     "samples": 0,
                     "samples_total": int(samples_total),
                     "samples_blink": int(samples_blink),
@@ -264,7 +322,8 @@ def compute_calibration_model(data: dict) -> Optional[dict]:
 
     valid = [p for p in points if p.get("gaze_h") is not None and p.get("gaze_v") is not None]
     if len(valid) < 4:
-        print("Not enough points for calibration.")
+        print(f"Not enough points for calibration ({len(valid)} valid, need at least 4).")
+        print("Tips: Face the camera directly, ensure good lighting, and look at each red dot until it moves.")
         return None
 
     tx = np.array([p["target_x"] for p in valid], dtype=float)
@@ -328,18 +387,16 @@ def _compute_fit_metrics(points: Sequence[dict], model: Optional[dict]) -> Optio
     }
 
 
-def verify_calibration(model: dict, screen_w: int, screen_h: int, win_x: int, win_y: int, fullscreen: bool = False) -> None:
-    """Verification loop: show estimated gaze point. Uses One-Euro smoothing from filters.py."""
+def verify_calibration(model: dict, screen_w: int, screen_h: int, win_x: int, win_y: int, fullscreen: bool = False, grid_cols: int = 1, grid_rows: int = 1):
+    """Verification loop: show estimated gaze point with Grid."""
     print("\n--- VERIFICATION MODE ---")
-    print("Look around the screen. A green circle should follow your eyes.")
+    print(f"Testing Grid: {grid_cols}x{grid_rows}")
+    print("Look at different boxes. The active box will light up.")
     print("Press 'q' or ESC to finish.")
 
     gaze = GazeTracking()
     webcam = cv2.VideoCapture(0)
-    if not webcam.isOpened():
-        print("Error: Unable to access camera.")
-        return
-
+    
     window_name = "Verification"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, screen_w, screen_h)
@@ -347,88 +404,129 @@ def verify_calibration(model: dict, screen_w: int, screen_h: int, win_x: int, wi
     if fullscreen:
         cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    # Initialize One-Euro filters from filters.py
-    # Constructor: OneEuroFilter(t0, x0, dx0=0.0, min_cutoff=1.0, beta=0.0, d_cutoff=1.0)
     now = time.time()
-    x_filt = OneEuroFilter(now, screen_w / 2, min_cutoff=0.5, beta=0.005, d_cutoff=1.0)
-    y_filt = OneEuroFilter(now, screen_h / 2, min_cutoff=0.5, beta=0.005, d_cutoff=1.0)
-
-    max_x = max(0, int(screen_w) - 1)
-    max_y = max(0, int(screen_h) - 1)
-
-    # Track blink state for filter reset
+    h_filt = OneEuroFilter(now, 0.5, min_cutoff=0.1, beta=0.01, d_cutoff=1.0)
+    v_filt = OneEuroFilter(now, 0.5, min_cutoff=0.1, beta=0.01, d_cutoff=1.0)
     was_blinking = False
+
+    BLINK_SKIP_FRAMES = 2
+    blink_skip_remaining = 0
+
+    # Asymmetric hysteresis
+    HYST_LEAVE = 7
+    HYST_RETURN = 3
+    display_c, display_r = 0, 0
+    prev_display_c, prev_display_r = 0, 0
+    candidate_c, candidate_r = -1, -1
+    candidate_count = 0
+
+    # Calculate cell dimensions
+    cell_w = screen_w / grid_cols
+    cell_h = screen_h / grid_rows
 
     while True:
         ret, frame = webcam.read()
-        if not ret:
-            break
-
+        if not ret: break
         gaze.refresh(frame)
 
         canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-        cv2.putText(
-            canvas,
-            "Verification: Look around.",
-            (50, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            canvas,
-            "Green Dot = Estimated Gaze",
-            (50, 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2,
-        )
+
+        # --- Draw Grid Lines ---
+        for i in range(1, grid_cols):
+            x = int(i * cell_w)
+            cv2.line(canvas, (x, 0), (x, screen_h), (50, 50, 50), 1)
+        for j in range(1, grid_rows):
+            y = int(j * cell_h)
+            cv2.line(canvas, (0, y), (screen_w, y), (50, 50, 50), 1)
 
         if gaze.pupils_located:
             is_blinking = gaze.is_blinking()
             if is_blinking:
                 was_blinking = True
             elif not is_blinking:
-                h_ratio = gaze.horizontal_ratio()
-                v_ratio = gaze.vertical_ratio()
-                if h_ratio is not None and v_ratio is not None:
-                    current_time = time.time()
+                if was_blinking:
+                    was_blinking = False
+                    blink_skip_remaining = BLINK_SKIP_FRAMES
 
-                    raw_x_f, raw_y_f = _apply_model(model, float(h_ratio), float(v_ratio))
+                if blink_skip_remaining > 0:
+                    blink_skip_remaining -= 1
+                else:
+                    h_ratio = gaze.horizontal_ratio()
+                    v_ratio = gaze.vertical_ratio()
+                    if h_ratio is not None and v_ratio is not None:
+                        current_time = time.time()
+                        smooth_h = h_filt(current_time, float(h_ratio))
+                        smooth_v = v_filt(current_time, float(v_ratio))
+                        smooth_x, smooth_y = _apply_model(model, smooth_h, smooth_v)
+                        smooth_x, smooth_y = int(smooth_x), int(smooth_y)
 
-                    # Re-initialize filters after a blink to avoid jump
-                    if was_blinking:
-                        x_filt = OneEuroFilter(current_time, raw_x_f, min_cutoff=0.5, beta=0.005, d_cutoff=1.0)
-                        y_filt = OneEuroFilter(current_time, raw_y_f, min_cutoff=0.5, beta=0.005, d_cutoff=1.0)
-                        was_blinking = False
+                        c_idx = max(0, min(grid_cols - 1, int(smooth_x / cell_w)))
+                        r_idx = max(0, min(grid_rows - 1, int(smooth_y / cell_h)))
 
-                    # Apply filter using __call__ interface
-                    smooth_x_f = x_filt(current_time, raw_x_f)
-                    smooth_y_f = y_filt(current_time, raw_y_f)
+                        if (c_idx, r_idx) == (display_c, display_r):
+                            candidate_c, candidate_r = -1, -1
+                            candidate_count = 0
+                        elif (c_idx, r_idx) == (candidate_c, candidate_r):
+                            candidate_count += 1
+                            threshold = HYST_RETURN if (c_idx, r_idx) == (prev_display_c, prev_display_r) else HYST_LEAVE
+                            if candidate_count >= threshold:
+                                prev_display_c, prev_display_r = display_c, display_r
+                                display_c, display_r = candidate_c, candidate_r
+                                candidate_count = 0
+                        else:
+                            candidate_c, candidate_r = c_idx, r_idx
+                            candidate_count = 1
 
-                    smooth_x = int(round(smooth_x_f))
-                    smooth_y = int(round(smooth_y_f))
+                        tl = (int(display_c * cell_w), int(display_r * cell_h))
+                        br = (int((display_c + 1) * cell_w), int((display_r + 1) * cell_h))
+                        cv2.rectangle(canvas, tl, br, (0, 100, 0), -1)
 
-                    smooth_x = max(0, min(max_x, smooth_x))
-                    smooth_y = max(0, min(max_y, smooth_y))
-
-                    cv2.circle(canvas, (smooth_x, smooth_y), 20, (0, 255, 0), -1)
-
-                    annotated = gaze.annotated_frame()
-                    small_frame = cv2.resize(annotated, (320, 240))
-                    canvas[screen_h - 240 : screen_h, 0:320] = small_frame
+                        cv2.circle(canvas, (smooth_x, smooth_y), 15, (0, 255, 0), -1)
 
         cv2.imshow(window_name, canvas)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key in (27, ord("q")):
-            break
+        if cv2.waitKey(1) & 0xFF in (27, ord("q")): break
 
     webcam.release()
     cv2.destroyAllWindows()
 
+def print_resolution_metrics(calibration_data, model, screen_w, screen_h):
+    points = calibration_data.get("points", [])
+    valid_points = [p for p in points if "std_h" in p]
+    
+    if not valid_points:
+        return
+
+    # 1. Calculate Average Jitter in Pixels
+    # We estimate pixel jitter by multiplying the normalized std_dev (0-1) by screen size
+    avg_jitter_h_norm = np.mean([p["std_h"] for p in valid_points])
+    avg_jitter_v_norm = np.mean([p["std_v"] for p in valid_points])
+    
+    jitter_px_h = avg_jitter_h_norm * screen_w
+    jitter_px_v = avg_jitter_v_norm * screen_h
+    
+    # 2. Get Accuracy (RMSE) from existing metrics
+    fit_metrics = calibration_data.get("fit_metrics", {})
+    rmse_px = fit_metrics.get("rmse_px", 50.0) # Default to 50px if missing
+    
+    # 3. Calculate Safe Zone Size (6-sigma rule + RMSE)
+    # This represents the minimum width a button/quadrant needs to be 
+    # for the user to hit it reliably 99.7% of the time.
+    safe_width_px = rmse_px + (6 * jitter_px_h)
+    safe_height_px = rmse_px + (6 * jitter_px_v)
+    
+    # 4. Calculate Max Quadrants
+    max_cols = int(screen_w / safe_width_px)
+    max_rows = int(screen_h / safe_height_px)
+    
+    print("\n--- QUANTIFIABLE METRICS ---")
+    print(f"Average Jitter (Noise): {jitter_px_h:.1f}px Horiz, {jitter_px_v:.1f}px Vert")
+    print(f"Calibration Error (RMSE): {rmse_px:.1f}px")
+    print(f"Min Reliable Target Size: {safe_width_px:.0f} x {safe_height_px:.0f} pixels")
+    print("-" * 30)
+    print(f"MAX RELIABLE GRID: {max_cols} Columns x {max_rows} Rows")
+    print("-" * 30)
+
+    return max_cols, max_rows
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -449,14 +547,19 @@ if __name__ == "__main__":
     print("Gaze tracking model loaded successfully!")
 
     print("\nCalibration instructions:")
-    print("- Sit ~60cm from the screen with steady lighting.")
+    print("- Sit ~60cm from the screen with steady lighting (50-60cm works well for 14\" MacBook Pro).")
     print("- Click to start, then look at each red dot.")
+    print("- On Retina Macs, if fullscreen clips the right side, run without --fullscreen and use:")
+    print("  --stimulus-width 1512 --stimulus-height 982 to match scaled resolution.")
     
     if not _wait_for_click():
         print("Calibration cancelled.")
         raise SystemExit(0)
 
-    screen_w, screen_h = get_screen_resolution(args.stimulus_width, args.stimulus_height)
+    if args.fullscreen:
+        screen_w, screen_h = get_primary_display_size()
+    else:
+        screen_w, screen_h = get_screen_resolution(args.stimulus_width, args.stimulus_height)
 
     if not _countdown(
         window_name="Calibration Countdown",
@@ -474,6 +577,16 @@ if __name__ == "__main__":
     if not cal_data:
         print("Calibration aborted.")
         raise SystemExit(0)
+
+    # Diagnostic: show why some points had no valid gaze
+    print("\nPer-point summary (frames in record window | valid gaze samples | blinks):")
+    for j, pt in enumerate(cal_data["points"]):
+        valid = pt.get("samples", 0)
+        total = pt.get("samples_total", 0)
+        blinks = pt.get("samples_blink", 0)
+        status = "OK" if pt.get("gaze_h") is not None else "NO DATA"
+        n_pts = len(cal_data["points"])
+        print(f"  Point {j + 1}/{n_pts}: total_frames={total}, valid_samples={valid}, blinks={blinks} -> {status}")
 
     model = compute_calibration_model(cal_data)
     if not model:
@@ -493,4 +606,19 @@ if __name__ == "__main__":
         json.dump(cal_data, f, indent=4)
     print(f"Saved to {filename}")
 
-    verify_calibration(model, screen_w, screen_h, args.window_x, args.window_y, args.fullscreen)
+    print(f"Saved to {filename}")
+
+    # 1. Calculate and Get Grid Size
+    rec_cols, rec_rows = print_resolution_metrics(cal_data, model, screen_w, screen_h)
+    
+    # 2. Launch Verification with that Grid
+    verify_calibration(
+        model, 
+        screen_w, 
+        screen_h, 
+        args.window_x, 
+        args.window_y, 
+        args.fullscreen,
+        grid_cols=rec_cols,
+        grid_rows=rec_rows
+    )
