@@ -342,7 +342,9 @@ def compute_calibration_model(data: dict) -> Optional[dict]:
         "type": "linear",
     }
 
-    # Preferred: poly2
+    # RESTORED: Poly2 fit
+    # Because your eye data is clean now, this will properly map the spherical
+    # movement of your eye to the flat plane of your monitor.
     if len(valid) >= 6:
         try:
             x_coef = _fit_poly2(gh, gv, tx)
@@ -455,8 +457,8 @@ def verify_calibration(model: dict, screen_w: int, screen_h: int, win_x: int, wi
                     v_ratio = gaze.vertical_ratio()
                     if h_ratio is not None and v_ratio is not None:
                         current_time = time.time()
-                        smooth_h = h_filt(current_time, float(h_ratio))
-                        smooth_v = v_filt(current_time, float(v_ratio))
+                        smooth_h = float(h_ratio)
+                        smooth_v = float(v_ratio)
                         smooth_x, smooth_y = _apply_model(model, smooth_h, smooth_v)
                         smooth_x, smooth_y = int(smooth_x), int(smooth_y)
 

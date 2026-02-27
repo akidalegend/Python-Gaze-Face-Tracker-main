@@ -206,26 +206,24 @@ class GazeAdapter:
         self._blinking = avg_ear < self.BLINK_THRESHOLD
 
     def horizontal_ratio(self):
-        """
-        Returns horizontal gaze ratio (0.0 = looking left, 1.0 = looking right).
-        Uses iris position relative to eye center, normalized by eye width.
-        """
         if not self.pupils_located:
             return None
         
-        # Calculate normalized horizontal offset from both eyes
-        # Iris position[0] is relative to eye center
-        # When looking LEFT, iris moves left (negative), we want ratio < 0.5
-        # When looking RIGHT, iris moves right (positive), we want ratio > 0.5
-        # Negate to get correct direction mapping
-        
-        left_ratio = 0.5 - (self._left_iris_pos[0] / (self._left_eye_width * 0.5)) if self._left_eye_width > 0 else 0.5
-        right_ratio = 0.5 - (self._right_iris_pos[0] / (self._right_eye_width * 0.5)) if self._right_eye_width > 0 else 0.5
+        left_ratio = 0.5 + (self._left_iris_pos[0] / (self._left_eye_width * 0.5)) if self._left_eye_width > 0 else 0.5
+        right_ratio = 0.5 + (self._right_iris_pos[0] / (self._right_eye_width * 0.5)) if self._right_eye_width > 0 else 0.5
         
         ratio = (left_ratio + right_ratio) / 2
-        return max(0.0, min(1.0, ratio))
+        return float(ratio)  # FIX: Removed max(0.0, min(1.0, ratio))
 
     def vertical_ratio(self):
+        if not self.pupils_located:
+            return None
+        
+        left_ratio = 0.5 + (self._left_iris_pos[1] / (self._left_eye_width * 0.7)) if self._left_eye_width > 0 else 0.5
+        right_ratio = 0.5 + (self._right_iris_pos[1] / (self._right_eye_width * 0.7)) if self._right_eye_width > 0 else 0.5
+        
+        ratio = (left_ratio + right_ratio) / 2
+        return float(ratio)  # FIX: Removed max(0.0, min(1.0, ratio))
         """
         Returns vertical gaze ratio (0.0 = looking up, 1.0 = looking down).
         Uses iris position relative to eye center.
